@@ -1,0 +1,14 @@
+{
+  "generated_at": "2026-09-05T03:54:59.620353+00:00",
+  "seed": 42,
+  "status": "DEMO_SIMULATION_DATA",
+  "disclaimer": "This data is synthetically generated for demonstration purposes only.",
+  "files": [
+    "sea_ice_daily.jsonl",
+    "sea_ice_monthly.csv",
+    "iceberg_positions.csv",
+    "weather_obs.csv",
+    "ocean_obs.csv",
+    "ml_features.csv"
+  ]
+}
