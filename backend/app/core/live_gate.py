@@ -1,0 +1,115 @@
+"""
+POLAR-AI LiveDataGate
+=====================
+Single function called by every service before returning demo data.
+
+Rules:
+  DATA_MODE=live  → NEVER return demo data. Return an OFFLINE response.
+  DATA_MODE=demo  → Always return demo data (explicit test/demo mode).
+  DATA_MODE=auto  → Return demo only when real source has no data yet.
+                    Once real data is available, use it.
+
+OFFLINE response format — what services return instead of fake data:
+{
+    "status": "OFFLINE",
+    "source_id": "sea_ice",
+    "message": "No real data available. Source: NSIDC — not yet fetched.",
+    "last_successful_update": null | ISO timestamp,
+    "data_mode": "offline",
+    "is_real": False,
+}
+
+This guarantees the frontend never silently shows fake data in LIVE mode.
+"""
+from __future__ import annotations
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
+from app.config import settings
+from app.core.freshness import FreshnessRegistry
+
+
+def is_live_mode() -> bool:
+    """True when the application must use real data only."""
+    return settings.effective_data_mode == "live"
+
+
+def is_demo_mode() -> bool:
+    return settings.DATA_MODE.lower() == "demo"
+
+
+def allow_demo_fallback() -> bool:
+    """True when demo fallback is acceptable (auto or demo mode)."""
+    return not is_live_mode()
+
+
+def offline_response(
+    source_id: str,
+    message: str = None,
+    last_updated: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """
+    Build an OFFLINE response to return instead of demo data in LIVE mode.
+    Every service uses this when real data is unavailable.
+    """
+    freshness = FreshnessRegistry.get(source_id)
+    last_ok = last_updated
+    if last_ok is None and freshness and freshness.last_updated:
+        last_ok = freshness.last_updated
+
+    return {
+        "status": "OFFLINE",
+        "source_id": source_id,
+        "message": message or (
+            f"No real data available for '{source_id}'. "
+            f"Data will appear once the source is connected."
+        ),
+        "last_successful_update": last_ok.isoformat() if last_ok else None,
+        "last_error": freshness.last_error if freshness else None,
+        "data_mode": "offline",
+        "is_real": False,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def check_or_offline(source_id: str, has_data: bool, message: str = None) -> Optional[Dict]:
+    """
+    Call at the top of every service function that might fall back to demo.
+
+    Returns:
+        None  → caller should proceed (real data available, or demo allowed)
+        Dict  → caller must return this OFFLINE dict to the endpoint
+
+    Usage in a service:
+        gate = check_or_offline("sea_ice", bool(real_data))
+        if gate is not None:
+            return gate
+        # ... use real_data ...
+    """
+    if has_data:
+        return None  # real data exists — proceed
+
+    if allow_demo_fallback():
+        return None  # demo fallback is allowed — proceed
+
+    # LIVE mode, no real data → return OFFLINE
+    return offline_response(source_id, message)
+
+
+def annotate_response(response: Dict, source_id: str, is_real: bool) -> Dict:
+    """
+    Add standardised freshness metadata to any service response dict.
+    Every API response must carry these fields.
+    """
+    freshness = FreshnessRegistry.get(source_id)
+    response["_meta"] = {
+        "source_id": source_id,
+        "is_real": is_real,
+        "data_mode": "live" if is_real else ("offline" if is_live_mode() else "demo"),
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "last_updated": freshness.last_updated.isoformat() if (freshness and freshness.last_updated) else None,
+        "age_seconds": freshness.to_dict().get("age_seconds") if freshness else None,
+        "status": freshness.status.value if freshness else "UNKNOWN",
+        "status_label": freshness.to_dict().get("status_label") if freshness else "UNKNOWN",
+    }
+    return response

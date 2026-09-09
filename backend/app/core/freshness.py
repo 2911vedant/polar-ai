@@ -216,57 +216,77 @@ class FreshnessRegistry:
 
 # ── Pre-register all data sources ─────────────────────────────────────────────
 def init_freshness_registry(settings):
-    """Call this at startup to pre-populate the registry with all sources."""
+    """
+    Pre-populate the freshness registry at startup.
+
+    Correct classification of free vs credentialed sources:
+      - weather:  Open-Meteo NWP  → always real, no credentials needed
+      - ocean:    Open-Meteo Marine → always real, no credentials needed
+      - icebergs: NIC CSV          → always real, free public HTTP
+      - sea_ice:  NSIDC daily CSV  → always real, free public HTTP
+      - satellite: Copernicus      → needs COPERNICUS_CLIENT_ID/SECRET
+      - ais:       AIS provider    → needs AIS_PROVIDER + AIS_API_KEY
+    """
     from app.core.freshness import FreshnessRegistry, FreshnessInfo, DataStatus
+
+    is_demo_mode = settings.DATA_MODE.lower() == "demo"
 
     sources = [
         FreshnessInfo(
             source_id="ais",
             source_name="AIS Vessel Tracking",
-            status=DataStatus.DEMO if not settings.has_ais else DataStatus.OFFLINE,
-            mode="demo" if not settings.has_ais else "live",
-            source=settings.AIS_PROVIDER or "demo",
-            is_real=settings.has_ais,
+            # AIS needs credentials. In demo mode: DEMO. No creds in live: OFFLINE.
+            status=(DataStatus.DEMO if is_demo_mode
+                    else (DataStatus.OFFLINE if not settings.has_ais
+                          else DataStatus.OFFLINE)),  # will be updated on first fetch
+            mode="demo" if is_demo_mode else "live",
+            source=settings.AIS_PROVIDER if settings.has_ais else ("demo" if is_demo_mode else "not_configured"),
+            is_real=settings.has_ais and not is_demo_mode,
         ),
         FreshnessInfo(
             source_id="satellite",
             source_name="Sentinel-1 SAR",
-            status=DataStatus.DEMO if not settings.has_copernicus else DataStatus.OFFLINE,
-            mode="demo" if not settings.has_copernicus else "live",
-            source="Copernicus Data Space" if settings.has_copernicus else "demo",
-            is_real=settings.has_copernicus,
+            status=(DataStatus.DEMO if is_demo_mode
+                    else (DataStatus.OFFLINE if not settings.has_copernicus
+                          else DataStatus.OFFLINE)),
+            mode="demo" if is_demo_mode else "live",
+            source="Copernicus Data Space" if settings.has_copernicus else "not_configured",
+            is_real=settings.has_copernicus and not is_demo_mode,
         ),
         FreshnessInfo(
             source_id="sea_ice",
-            source_name="Sea Ice Concentration",
-            status=DataStatus.DEMO if not settings.has_earthdata else DataStatus.OFFLINE,
-            mode="demo" if not settings.has_earthdata else "live",
-            source="NSIDC / NOAA" if settings.has_earthdata else "demo",
-            is_real=settings.has_earthdata,
+            source_name="Sea Ice — NSIDC",
+            # NSIDC daily CSV is free. In demo mode: DEMO. Otherwise: OFFLINE until fetched.
+            status=DataStatus.DEMO if is_demo_mode else DataStatus.OFFLINE,
+            mode="demo" if is_demo_mode else "live",
+            source="NSIDC Sea Ice Index G02135 v3 (free)",
+            is_real=not is_demo_mode,
         ),
         FreshnessInfo(
             source_id="icebergs",
-            source_name="Iceberg Tracking",
-            status=DataStatus.LATEST_AVAILABLE,  # NIC data is open HTTP
-            mode="live",
-            source="US National Ice Center",
-            is_real=True,
+            source_name="Iceberg Tracking — NIC",
+            status=DataStatus.DEMO if is_demo_mode else DataStatus.OFFLINE,
+            mode="demo" if is_demo_mode else "live",
+            source="US National Ice Center (free)",
+            is_real=not is_demo_mode,
         ),
         FreshnessInfo(
             source_id="weather",
-            source_name="Weather / ERA5",
-            status=DataStatus.DEMO if not settings.has_cds else DataStatus.OFFLINE,
-            mode="demo" if not settings.has_cds else "live",
-            source="ECMWF / Copernicus CDS" if settings.has_cds else "demo",
-            is_real=settings.has_cds,
+            # Open-Meteo is free — always real, no credentials needed
+            source_name="Weather — Open-Meteo NWP",
+            status=DataStatus.DEMO if is_demo_mode else DataStatus.OFFLINE,
+            mode="demo" if is_demo_mode else "live",
+            source="Open-Meteo NWP (free, no credentials)",
+            is_real=not is_demo_mode,
         ),
         FreshnessInfo(
             source_id="ocean",
-            source_name="Ocean Currents",
-            status=DataStatus.DEMO if not settings.has_cmems else DataStatus.OFFLINE,
-            mode="demo" if not settings.has_cmems else "live",
-            source="Copernicus Marine" if settings.has_cmems else "demo",
-            is_real=settings.has_cmems,
+            # Open-Meteo Marine is free — always real
+            source_name="Ocean — Open-Meteo Marine",
+            status=DataStatus.DEMO if is_demo_mode else DataStatus.OFFLINE,
+            mode="demo" if is_demo_mode else "live",
+            source="Open-Meteo Marine (free, no credentials)",
+            is_real=not is_demo_mode,
         ),
         FreshnessInfo(
             source_id="database",

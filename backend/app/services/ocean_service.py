@@ -1,47 +1,76 @@
-"""Ocean service — uses Open-Meteo Marine when available, demo fallback."""
-from app.services import demo_service
+"""
+Ocean Service — Open-Meteo Marine real data (free, no key required).
+LIVE mode: returns OFFLINE if fetch failed.
+DEMO mode: returns synthetic current grid.
+"""
+import math
+from datetime import datetime, timezone
 from app.core.freshness import FreshnessRegistry
+from app.core.live_gate import check_or_offline, allow_demo_fallback
 
 
 def _freshness_tag(is_real: bool) -> dict:
     f = FreshnessRegistry.get("ocean")
-    return {"freshness": f.to_dict() if f else None, "is_real": is_real,
-            "data_mode": "live" if is_real else "demo"}
+    return {
+        "freshness": f.to_dict() if f else None,
+        "is_real": is_real,
+        "data_mode": "live" if is_real else ("offline" if not allow_demo_fallback() else "demo"),
+    }
 
 
-def get_current_ocean():
+def _get_real_grid():
     try:
         from app.sources.ocean_source import get_ocean_source
         grid = get_ocean_source().get_grid()
-        if grid:
-            avg_speed = sum(p["current_speed_ms"] for p in grid) / len(grid)
-            sst_vals = [p["sea_surface_temp_celsius"] for p in grid if p.get("sea_surface_temp_celsius")]
-            avg_sst = sum(sst_vals) / len(sst_vals) if sst_vals else None
-            result = {
-                "timestamp": grid[0].get("observation_time"),
-                "grid_points": grid,
-                "avg_current_speed_ms": round(avg_speed, 3),
-                "avg_sst_celsius": round(avg_sst, 1) if avg_sst else None,
-            }
-            result.update(_freshness_tag(True))
-            return result
+        return grid if grid else []
     except Exception:
-        pass
-    result = demo_service.get_ocean()
+        return []
+
+
+def get_current_ocean():
+    grid = _get_real_grid()
+    has_real = bool(grid)
+
+    gate = check_or_offline("ocean", has_real,
+        "Open-Meteo Marine data not yet fetched.")
+    if gate is not None:
+        return gate
+
+    if has_real:
+        avg_speed = sum(p["current_speed_ms"] for p in grid) / len(grid)
+        sst_vals = [p["sea_surface_temp_celsius"] for p in grid
+                    if p.get("sea_surface_temp_celsius") is not None]
+        avg_sst = round(sum(sst_vals) / len(sst_vals), 1) if sst_vals else None
+        result = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "grid_points": grid,
+            "avg_current_speed_ms": round(avg_speed, 3),
+            "avg_sst_celsius": avg_sst,
+            "source": "Open-Meteo Marine (wave model + ACC current estimate)",
+            "note": "SST not available from Open-Meteo Marine. CMEMS credentials needed for SST.",
+        }
+        result.update(_freshness_tag(True))
+        return result
+
+    from app.services.demo_service import get_ocean as _demo_oc
+    result = _demo_oc()
     result.update(_freshness_tag(False))
     return result
 
 
 def get_nearest(lat: float, lon: float):
-    """Get ocean conditions at a specific lat/lon."""
-    try:
-        from app.sources.ocean_source import get_ocean_source
-        pt = get_ocean_source().get_nearest(lat, lon)
-        if pt:
-            return {**pt, **_freshness_tag(True)}
-    except Exception:
-        pass
-    import math
-    grid = demo_service.get_ocean()["grid_points"]
-    nearest = min(grid, key=lambda p: math.sqrt((p["latitude"] - lat) ** 2 + (p["longitude"] - lon) ** 2))
+    grid = _get_real_grid()
+    if grid:
+        pt = min(grid, key=lambda p:
+                 math.sqrt((p["latitude"] - lat)**2 + (p["longitude"] - lon)**2))
+        return {**pt, **_freshness_tag(True)}
+
+    gate = check_or_offline("ocean", False)
+    if gate is not None:
+        return gate
+
+    from app.services.demo_service import get_ocean as _demo_oc
+    demo_grid = _demo_oc()["grid_points"]
+    nearest = min(demo_grid, key=lambda p:
+                  math.sqrt((p["latitude"] - lat)**2 + (p["longitude"] - lon)**2))
     return {**nearest, **_freshness_tag(False)}

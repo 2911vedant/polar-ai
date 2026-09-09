@@ -16,6 +16,13 @@ api.interceptors.response.use(
   }
 )
 
+// ── Live Data Engine ───────────────────────────────────────────────────────────
+export const fetchLiveStatus      = () => api.get('/api/live/status').then(r => r.data)
+export const fetchLiveLastUpdate  = () => api.get('/api/live/last-update').then(r => r.data)
+export const fetchLiveChanges     = () => api.get('/api/live/changes').then(r => r.data)
+export const fetchLiveHistory     = (limit = 24) => api.get(`/api/live/history?limit=${limit}`).then(r => r.data)
+export const triggerLiveUpdate    = () => api.post('/api/live/trigger').then(r => r.data)
+
 // ── Health / System ────────────────────────────────────────────────────────────
 export const fetchHealth        = () => api.get('/api/health').then(r => r.data)
 export const fetchSystemStatus  = () => api.get('/api/system/status').then(r => r.data)

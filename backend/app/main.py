@@ -1,6 +1,10 @@
 """
-POLAR-AI v2 FastAPI Application
-Antarctic Ice Intelligence & Navigation Decision Support
+POLAR-AI v2 — Live Data Engine
+================================
+Starts with DATA_MODE=live by default.
+Free sources (weather, ocean, icebergs, sea ice) connect on startup.
+Credentialed sources (satellite, AIS) connect when credentials are present.
+All sources update every UPDATE_INTERVAL_MINUTES (default 60).
 """
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -10,6 +14,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from loguru import logger
 import time
+import asyncio
 
 from app.config import settings
 from app.database import check_db_connection, check_postgis
@@ -20,7 +25,7 @@ from app.routers import (
     health, dashboard, sea_ice, icebergs,
     weather, ocean, routes, analytics,
     data_sources, agent, simulation,
-    system, satellite, vessel, alerts,
+    system, satellite, vessel, alerts, live,
 )
 
 limiter = Limiter(key_func=get_remote_address)
@@ -30,19 +35,23 @@ limiter = Limiter(key_func=get_remote_address)
 async def lifespan(app_instance: FastAPI):
     """Startup / shutdown lifecycle."""
     logger.info("=" * 60)
-    logger.info(f"POLAR-AI v{settings.APP_VERSION} Starting Up")
+    logger.info(f"POLAR-AI v{settings.APP_VERSION} — LIVE DATA ENGINE")
     logger.info(f"Data Mode: {settings.DATA_MODE}  (effective: {settings.effective_data_mode})")
-    logger.info(f"LLM Provider: {settings.llm_provider}")
-    logger.info(f"Copernicus: {'✓' if settings.has_copernicus else '✗'}")
-    logger.info(f"NSIDC/Earthdata: {'✓' if settings.has_earthdata else '✗'}")
-    logger.info(f"CMEMS Ocean: {'✓' if settings.has_cmems else '✗'}")
-    logger.info(f"AIS Provider: {settings.AIS_PROVIDER or '✗ (demo mode)'}")
+    logger.info(f"Update interval: every {settings.UPDATE_INTERVAL_MINUTES} minutes")
+    logger.info(f"LLM: {settings.llm_provider}")
+    logger.info("-" * 60)
+    logger.info(f"  Sentinel-1 SAR:  {'✓ configured' if settings.has_copernicus else '✗ not configured (need COPERNICUS_CLIENT_ID/SECRET)'}")
+    logger.info(f"  NSIDC Sea Ice:   ✓ free / no credentials")
+    logger.info(f"  NIC Icebergs:    ✓ free / no credentials")
+    logger.info(f"  Open-Meteo Wx:   ✓ free / no credentials")
+    logger.info(f"  Open-Meteo Ocean:✓ free / no credentials")
+    logger.info(f"  AIS Vessel:      {'✓ ' + settings.AIS_PROVIDER if settings.has_ais else '✗ not configured (need AIS_PROVIDER + AIS_API_KEY)'}")
     logger.info("=" * 60)
 
-    # 1. Init freshness registry
+    # 1. Init freshness registry with correct real/demo classification
     init_freshness_registry(settings)
 
-    # 2. Database check
+    # 2. Database
     db_ok = check_db_connection()
     if db_ok:
         logger.info("✓ Database connected")
@@ -50,49 +59,41 @@ async def lifespan(app_instance: FastAPI):
         if check_postgis():
             logger.info("✓ PostGIS available")
     else:
-        logger.warning("✗ Database not connected — running in limited mode")
+        logger.warning("✗ Database unavailable — some features limited")
         FreshnessRegistry.update("database", status=DataStatus.OFFLINE)
 
-    # 3. Ensure cache/data dirs exist
+    # 3. Ensure directories exist
     import os
-    os.makedirs(os.path.join(settings.DATA_DIR, "cache"), exist_ok=True)
-    os.makedirs(settings.DEMO_DATA_DIR, exist_ok=True)
-    os.makedirs(settings.MODELS_DIR, exist_ok=True)
+    for d in [settings.DATA_DIR, settings.DEMO_DATA_DIR, settings.MODELS_DIR,
+              os.path.join(settings.DATA_DIR, "cache")]:
+        os.makedirs(d, exist_ok=True)
 
-    # 4. Bootstrap free real sources (no credentials needed)
-    # Weather and Ocean use Open-Meteo — free, always attempt
-    # Icebergs use NIC — free public CSV
-    import asyncio
-    async def _bootstrap():
-        try:
-            from app.sources.weather_source import get_weather_source
-            await get_weather_source().fetch()
-        except Exception as e:
-            logger.warning(f"Weather bootstrap failed: {e}")
-        try:
-            from app.sources.ocean_source import get_ocean_source
-            await get_ocean_source().fetch()
-        except Exception as e:
-            logger.warning(f"Ocean bootstrap failed: {e}")
-        try:
-            from app.sources.iceberg_source import get_iceberg_source
-            await get_iceberg_source().fetch()
-        except Exception as e:
-            logger.warning(f"Iceberg bootstrap failed: {e}")
-        try:
-            from app.sources.sea_ice_source import get_sea_ice_source
-            await get_sea_ice_source().fetch()
-        except Exception as e:
-            logger.warning(f"Sea ice bootstrap failed: {e}")
+    # 4. Wire WebSocket broadcast into hourly update service
+    from app.routers.live import manager as live_manager
+    from app.services.hourly_update_service import set_broadcast_fn
+    set_broadcast_fn(live_manager.broadcast)
 
-    asyncio.create_task(_bootstrap())
+    # 5. Run initial data synchronization immediately at startup
+    async def _initial_sync():
+        await asyncio.sleep(2)  # give the server 2s to fully start
+        logger.info("[startup] Running initial data synchronization...")
+        try:
+            from app.services.hourly_update_service import run_hourly_update
+            await run_hourly_update(triggered_by="startup")
+        except Exception as e:
+            logger.error(f"[startup] Initial sync failed: {e}")
 
-    # 5. Start background scheduler
+    asyncio.create_task(_initial_sync())
+
+    # 6. Start APScheduler for recurring updates
     try:
         from app.ingestion.scheduler import start_scheduler
         start_scheduler()
+        logger.info(f"✓ Scheduler started — updates every {settings.UPDATE_INTERVAL_MINUTES} min")
     except Exception as e:
         logger.warning(f"Scheduler start failed: {e}")
+
+    logger.info("✓ POLAR-AI ready — http://localhost:8000/api/docs")
 
     yield
 
@@ -106,27 +107,17 @@ async def lifespan(app_instance: FastAPI):
 
 
 app = FastAPI(
-    title="POLAR-AI v2",
+    title="POLAR-AI",
     description="""
-## Antarctic Ice Intelligence & Navigation Decision Support System
+## Antarctic Ice Intelligence & Navigation Decision Support
 
-**SIH26059** — AI-Enabled Antarctic Sea-Ice, Iceberg Trajectory & Navigation Decision Support
-
-### Data Sources
-- 🛰️ Sentinel-1 SAR (Copernicus Data Space — requires credentials)
-- 🧊 NSIDC Sea Ice Index (free, always available)
-- 🏔️ US National Ice Center Icebergs (free, always available)
-- 🌬️ Open-Meteo NWP Weather (free, always available)
-- 🌊 Open-Meteo Marine Ocean (free, always available)
-- 🚢 AIS Vessel Tracking (configurable provider)
+**SIH26059** | Live data from NSIDC, NIC, Open-Meteo, Copernicus, AIS
 
 ### Data Modes
-- **LIVE** — real data from external sources
-- **NEAR_REAL_TIME** — recent external data within expected update cycle
-- **LATEST_AVAILABLE** — external data, possibly delayed
-- **DEMO** — synthetic deterministic data (seed=42)
+- **LIVE** (default) — real data; OFFLINE when source unavailable
+- **DEMO** — explicit synthetic mode for testing (DATA_MODE=demo)
 
-> Research prototype. Not certified for autonomous navigation.
+> Research prototype. Not for real vessel navigation.
     """,
     version=settings.APP_VERSION,
     docs_url="/api/docs",
@@ -157,8 +148,9 @@ async def timing_middleware(request: Request, call_next):
     return response
 
 
-# ── Register all routers ───────────────────────────────────────────────────────
+# ── Routers ────────────────────────────────────────────────────────────────────
 app.include_router(health.router,       prefix="/api",            tags=["Health"])
+app.include_router(live.router,         prefix="/api",            tags=["Live Data Engine"])
 app.include_router(system.router,       prefix="/api",            tags=["System"])
 app.include_router(dashboard.router,    prefix="/api",            tags=["Dashboard"])
 app.include_router(sea_ice.router,      prefix="/api/sea-ice",    tags=["Sea Ice"])
@@ -181,9 +173,10 @@ async def root():
         "name": "POLAR-AI",
         "version": settings.APP_VERSION,
         "sih_problem": "SIH26059",
-        "subtitle": "Antarctic Ice Intelligence & Navigation Decision Support",
         "data_mode": settings.effective_data_mode,
+        "update_interval_minutes": settings.UPDATE_INTERVAL_MINUTES,
         "docs": "/api/docs",
-        "system_status": "/api/system/status",
+        "live_status": "/api/live/status",
+        "ws_live": "/ws/live",
         "disclaimer": "Research prototype. Not for real navigation.",
     }
