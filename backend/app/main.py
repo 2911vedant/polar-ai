@@ -73,7 +73,17 @@ async def lifespan(app_instance: FastAPI):
     from app.services.hourly_update_service import set_broadcast_fn
     set_broadcast_fn(live_manager.broadcast)
 
-    # 5. Run initial data synchronization immediately at startup
+    # 5. Start AISStream WebSocket immediately if configured
+    if settings.has_ais and settings.AIS_PROVIDER.lower() == "aisstream":
+        async def _start_aisstream():
+            await asyncio.sleep(3)
+            from app.sources.vessel_source import get_vessel_service
+            from app.services.hourly_update_service import _ensure_aisstream_running
+            _ensure_aisstream_running(get_vessel_service())
+            logger.info("✓ AISStream WebSocket listener started")
+        asyncio.create_task(_start_aisstream())
+
+    # 6. Run initial data synchronization immediately at startup
     async def _initial_sync():
         await asyncio.sleep(2)  # give the server 2s to fully start
         logger.info("[startup] Running initial data synchronization...")

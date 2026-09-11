@@ -157,7 +157,12 @@ class Settings(BaseSettings):
     DEMO_DATA_DIR: str = os.path.join(BASE_DIR, "data", "demo")
 
     model_config = {
-        "env_file": ".env",
+        # Look for .env in the project root (parent of backend/)
+        "env_file": [
+            ".env",
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+        ],
         "case_sensitive": True,
         "extra": "ignore",
     }

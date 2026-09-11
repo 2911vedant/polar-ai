@@ -420,18 +420,51 @@ async def update_vessels(run_id: str) -> Dict:
             return _finish_task(t, "skipped",
                 note="No AIS credentials. Set AIS_PROVIDER and AIS_API_KEY.")
 
+        provider = (settings.AIS_PROVIDER or "").lower()
+
+        # AISStream uses WebSocket — start the stream task if not already running
+        if provider == "aisstream":
+            # Check if we already have a live position from the WS stream
+            pos = svc.get_position()
+            if pos.get("is_real"):
+                obs_time = None
+                ts = pos.get("timestamp")
+                if ts:
+                    try:
+                        obs_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+                FreshnessRegistry.update("ais", status=DataStatus.LIVE,
+                                         last_updated=obs_time or datetime.now(timezone.utc))
+                return _finish_task(t, "success",
+                    records_received=1, records_saved=1,
+                    observation_time=obs_time,
+                    note=f"{pos.get('vessel_name','?')} @ {pos.get('latitude',0):.4f},{pos.get('longitude',0):.4f}")
+
+            # No live position yet — ensure the WS listener is running
+            _ensure_aisstream_running(svc)
+            FreshnessRegistry.update("ais", status=DataStatus.OFFLINE,
+                                     last_error="AISStream connected, waiting for position fix in Antarctic region")
+            return _finish_task(t, "no_new_data",
+                note="AISStream WebSocket connecting — waiting for vessel in Antarctic bounding box")
+
+        # REST-based providers
         await svc.poll_once()
         pos = svc.get_position()
-
         if pos.get("is_real"):
-            obs_time = datetime.fromisoformat(
-                pos["timestamp"].replace("Z", "+00:00")) if pos.get("timestamp") else None
+            obs_time = None
+            ts = pos.get("timestamp")
+            if ts:
+                try:
+                    obs_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    pass
             FreshnessRegistry.update("ais", status=DataStatus.LIVE,
                                      last_updated=obs_time or datetime.now(timezone.utc))
             return _finish_task(t, "success",
                 records_received=1, records_saved=1,
                 observation_time=obs_time,
-                note=f"{pos.get('vessel_name','?')} @ {pos.get('latitude','?'):.4f},{pos.get('longitude','?'):.4f}")
+                note=f"{pos.get('vessel_name','?')} @ {pos.get('latitude',0):.4f},{pos.get('longitude',0):.4f}")
         else:
             FreshnessRegistry.update("ais", status=DataStatus.OFFLINE,
                                      last_error="AIS poll returned no real position")
@@ -441,6 +474,48 @@ async def update_vessels(run_id: str) -> Dict:
     except Exception as e:
         FreshnessRegistry.update("ais", last_error=str(e), status=DataStatus.OFFLINE)
         return _finish_task(t, "failed", error=str(e))
+
+
+# ── AISStream WebSocket background task ───────────────────────────────────────
+
+_aisstream_task: Optional[asyncio.Task] = None
+
+
+def _ensure_aisstream_running(svc):
+    """Start the AISStream WebSocket listener if not already running."""
+    global _aisstream_task
+    if _aisstream_task and not _aisstream_task.done():
+        return  # already running
+
+    async def _run_stream():
+        from app.sources.vessel_source import AISStreamAdapter
+        from app.core.freshness import FreshnessRegistry, DataStatus
+        adapter = AISStreamAdapter()
+        logger.info("[ais] Starting AISStream WebSocket listener for Antarctic region")
+        retry_delay = 5
+        while True:
+            try:
+                async for pos in adapter.stream():
+                    svc.update_position(pos)
+                    # Broadcast via live WebSocket
+                    if _ws_broadcast_fn:
+                        try:
+                            await _ws_broadcast_fn({
+                                "event": "VESSEL_UPDATED",
+                                "source_id": "ais",
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "position": pos.to_dict(),
+                            })
+                        except Exception:
+                            pass
+                retry_delay = 5  # reset on clean exit
+            except Exception as e:
+                logger.warning(f"[ais] Stream error, retrying in {retry_delay}s: {e}")
+                FreshnessRegistry.update("ais", last_error=str(e), status=DataStatus.OFFLINE)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 300)  # exponential backoff up to 5 min
+
+    _aisstream_task = asyncio.create_task(_run_stream())
 
 
 async def recalculate_risk(run_id: str) -> Dict:
@@ -674,7 +749,7 @@ async def _persist_run(record: Dict, run_id: str):
                 VALUES
                   (:id, :run_num, :started, :finished, :duration,
                    :triggered, :status, :attempted, :succeeded, :failed,
-                   :summary::jsonb, :next_run)
+                   :summary, :next_run)
             """), {
                 "id": run_id,
                 "run_num": record["run_number"],
