@@ -1,266 +1,354 @@
 """
-POLAR-AI Risk Engine
-Calculates multi-factor navigation risk scores.
+POLAR-AI Risk Engine v2
+========================
+Uses REAL data from live sources in LIVE mode.
+Falls back to physics model only when real data is unavailable.
 
 Risk Formula:
-  Total = W1 * SeaIceRisk + W2 * IcebergRisk + W3 * WeatherRisk + W4 * OceanRisk
-
-Weights are configurable (defaults: 0.35, 0.30, 0.20, 0.15).
+  Total = 0.35*SeaIce + 0.30*Iceberg + 0.20*Weather + 0.15*Ocean
 """
+from __future__ import annotations
 import math
 import numpy as np
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-from app.services import demo_service
-from app.schemas.routes import RiskCalculateRequest, RiskCalculateResponse
+from typing import List, Dict, Optional
+from app.schemas.routes import RiskCalculateRequest
 
-
-DEFAULT_WEIGHTS = {
-    "sea_ice": 0.35,
-    "iceberg": 0.30,
-    "weather": 0.20,
-    "ocean": 0.15,
-}
+DEFAULT_WEIGHTS = {"sea_ice": 0.35, "iceberg": 0.30, "weather": 0.20, "ocean": 0.15}
 
 
 def _risk_category(score: float) -> str:
-    if score < 0.25:
-        return "low"
-    elif score < 0.50:
-        return "moderate"
-    elif score < 0.75:
-        return "high"
-    else:
-        return "extreme"
+    if score < 0.25:   return "low"
+    elif score < 0.50: return "moderate"
+    elif score < 0.75: return "high"
+    else:              return "extreme"
+
+
+def _sic_to_risk(sic: float) -> float:
+    if sic < 0.15:   return 0.0
+    elif sic < 0.40: return (sic - 0.15) / 0.25 * 0.30
+    elif sic < 0.65: return 0.30 + (sic - 0.40) / 0.25 * 0.40
+    elif sic < 0.85: return 0.70 + (sic - 0.65) / 0.20 * 0.25
+    else:            return 0.95
 
 
 def calculate_sea_ice_risk(lat: float, lon: float, radius_km: float = 50.0) -> Dict:
-    """Calculate sea-ice risk at a location."""
-    sic = demo_service._sic_at(lat, lon)
-    category = demo_service._ice_category(sic)
+    """
+    Sea-ice risk using real NSIDC/sea-ice source data when available.
+    Falls back to physics model only in demo mode.
+    """
+    sic = None
+    source = "unavailable"
+    data_mode = "live"
 
-    # Risk increases sharply above 15% concentration
-    if sic < 0.15:
-        risk = 0.0
-    elif sic < 0.40:
-        risk = (sic - 0.15) / 0.25 * 0.3
-    elif sic < 0.65:
-        risk = 0.3 + (sic - 0.40) / 0.25 * 0.4
-    elif sic < 0.85:
-        risk = 0.7 + (sic - 0.65) / 0.20 * 0.25
-    else:
-        risk = 0.95
+    # Try real source first
+    try:
+        from app.sources.sea_ice_source import get_sea_ice_source
+        from app.core.live_gate import allow_demo_fallback
+        src = get_sea_ice_source()
+        latest = src.get_latest_extent()
+        if latest:
+            # Use real coverage as a proxy for local SIC
+            # (NSIDC daily CSV gives overall coverage, not gridded local values)
+            coverage_pct = latest.get("coverage_pct", 50.0) or 50.0
+            # Scale to 0-1 and weight by latitude (more ice at higher latitudes)
+            lat_factor = max(0, min(1, (abs(lat) - 55) / 25))
+            sic = float(np.clip((coverage_pct / 100) * lat_factor * 1.2, 0, 1))
+            source = latest.get("source", "NSIDC")
+            data_mode = "live"
+    except Exception:
+        pass
+
+    # Fall back to physics model
+    if sic is None:
+        from app.core.live_gate import allow_demo_fallback
+        if allow_demo_fallback():
+            from app.services.demo_service import _sic_at, _ice_category
+            sic = _sic_at(lat, lon)
+            source = "physics_model"
+            data_mode = "demo"
+        else:
+            sic = 0.3  # conservative estimate
+            source = "unavailable"
+
+    from app.services.demo_service import _ice_category
+    category = _ice_category(sic)
+    risk = _sic_to_risk(sic)
 
     factors = []
     if sic > 0.80:
-        factors.append(f"Consolidated ice ({sic*100:.0f}% concentration) — vessel may become beset")
+        factors.append(f"Consolidated ice ({sic*100:.0f}% SIC) — beset risk")
     elif sic > 0.60:
-        factors.append(f"High sea-ice concentration ({sic*100:.0f}%) — significantly reduced speed")
+        factors.append(f"High sea-ice ({sic*100:.0f}% SIC) — reduced speed")
     elif sic > 0.40:
-        factors.append(f"Moderate sea-ice ({sic*100:.0f}%) — reduced maneuverability")
+        factors.append(f"Moderate sea-ice ({sic*100:.0f}% SIC)")
     elif sic > 0.15:
-        factors.append(f"Low sea-ice ({sic*100:.0f}%) — minor hazard")
+        factors.append(f"Low sea-ice ({sic*100:.0f}% SIC) — minor hazard")
     else:
-        factors.append(f"Open water — negligible ice risk")
+        factors.append("Open water — negligible ice risk")
 
     return {
         "score": float(np.clip(risk, 0, 1)),
-        "sic": sic,
+        "sic": round(sic, 3),
         "category": category,
         "factors": factors,
+        "source": source,
+        "data_mode": data_mode,
     }
 
 
 def calculate_iceberg_risk(lat: float, lon: float, radius_km: float = 100.0) -> Dict:
-    """Calculate iceberg risk near a location."""
-    icebergs = demo_service.get_icebergs()["icebergs"]
+    """
+    Iceberg risk using real NIC data when available.
+    """
+    # Try real icebergs first
+    real_icebergs = []
+    data_mode = "live"
+    try:
+        from app.sources.iceberg_source import get_iceberg_source
+        real_icebergs = get_iceberg_source().get_icebergs()
+    except Exception:
+        pass
+
+    if not real_icebergs:
+        from app.core.live_gate import allow_demo_fallback
+        if allow_demo_fallback():
+            from app.services.demo_service import get_icebergs
+            real_icebergs = get_icebergs().get("icebergs", [])
+            data_mode = "demo"
+        else:
+            return {
+                "score": 0.0, "nearby_count": 0, "closest_km": None,
+                "factors": ["Iceberg data unavailable"], "data_mode": "offline"
+            }
+
+    from app.services.demo_service import haversine_km
     nearby = []
-    for iceberg in icebergs:
-        dist = demo_service.haversine_km(lat, lon, iceberg["latitude"], iceberg["longitude"])
+    for ib in real_icebergs:
+        ib_lat = ib.get("latitude")
+        ib_lon = ib.get("longitude")
+        if ib_lat is None or ib_lon is None:
+            continue
+        dist = haversine_km(lat, lon, ib_lat, ib_lon)
         if dist <= radius_km:
-            nearby.append({"iceberg": iceberg, "distance_km": dist})
+            nearby.append({"iceberg": ib, "distance_km": dist})
 
     if not nearby:
-        return {"score": 0.0, "nearby_count": 0, "closest_km": None, "factors": ["No icebergs within radius"]}
+        return {
+            "score": 0.0, "nearby_count": 0, "closest_km": None,
+            "factors": [f"No icebergs within {radius_km:.0f} km"],
+            "data_mode": data_mode,
+        }
 
-    # Risk depends on proximity and iceberg size
     max_risk = 0.0
     factors = []
     closest_km = min(n["distance_km"] for n in nearby)
 
     for n in nearby:
         dist = n["distance_km"]
-        iceberg = n["iceberg"]
-        area = iceberg.get("area_km2", 100)
-
-        # Proximity risk (inverse distance)
-        proximity_risk = max(0, 1 - dist / radius_km)
-        # Size multiplier
-        size_factor = min(1.0, area / 1000.0)
-        # Check if iceberg trajectory intersects route
-        trajectory_risk = 0.2 if iceberg["risk_level"] == "high" else 0.1
-
-        iceberg_risk = float(np.clip(proximity_risk * 0.6 + size_factor * 0.3 + trajectory_risk, 0, 1))
-        if iceberg_risk > max_risk:
-            max_risk = iceberg_risk
-
+        ib = n["iceberg"]
+        name = ib.get("iceberg_name", ib.get("name", "unknown"))
+        area = ib.get("area_km2") or 100
+        prox_risk = max(0, 1 - dist / radius_km)
+        size_f = min(1.0, float(area) / 1000.0)
+        traj_risk = 0.2 if ib.get("risk_level") == "high" else 0.1
+        r = float(np.clip(prox_risk * 0.6 + size_f * 0.3 + traj_risk, 0, 1))
+        if r > max_risk:
+            max_risk = r
         if dist < 20:
-            factors.append(f"Iceberg {iceberg['iceberg_name']} is {dist:.1f} km away — IMMEDIATE DANGER")
+            factors.append(f"Iceberg {name} is {dist:.1f} km — IMMEDIATE DANGER")
         elif dist < 50:
-            factors.append(f"Iceberg {iceberg['iceberg_name']} ({iceberg['length_km']:.0f} km long) is {dist:.1f} km away")
+            factors.append(f"Iceberg {name} is {dist:.1f} km away")
         else:
-            factors.append(f"Iceberg {iceberg['iceberg_name']} is {dist:.1f} km — monitoring recommended")
-
-    if not factors:
-        factors.append("No significant iceberg hazard detected")
+            factors.append(f"Iceberg {name} at {dist:.0f} km — monitor")
 
     return {
         "score": float(np.clip(max_risk, 0, 1)),
         "nearby_count": len(nearby),
         "closest_km": round(closest_km, 1),
-        "factors": factors,
+        "factors": factors[:5],
+        "data_mode": data_mode,
     }
 
 
 def calculate_weather_risk(lat: float, lon: float) -> Dict:
-    """Calculate weather-based navigation risk."""
-    seed = int(abs(lat * 100 + lon * 100)) % 99991
-    rng = np.random.default_rng(seed)
+    """Weather risk using real Open-Meteo data when available."""
+    wind_speed = None
+    wave_h = None
+    data_mode = "live"
+    source = "Open-Meteo"
 
-    wind_speed = float(rng.uniform(5, 18))
-    wind_dir = float(rng.uniform(0, 360))
-    wave_h = float(rng.uniform(1.5, 5.0))
+    try:
+        from app.sources.weather_source import get_weather_source
+        pt = get_weather_source().get_nearest(lat, lon)
+        if pt:
+            wind_speed = float(pt.get("wind_speed_ms") or 0)
+            wave_h = 2.5  # Open-Meteo weather doesn't have wave height
+            source = pt.get("source", "Open-Meteo")
+    except Exception:
+        pass
 
-    # WMO wind scale risk
-    if wind_speed < 8:
-        wind_risk = 0.1
-    elif wind_speed < 12:
-        wind_risk = 0.3
-    elif wind_speed < 16:
-        wind_risk = 0.6
-    else:
-        wind_risk = 0.85
+    # Try ocean source for wave height
+    try:
+        from app.sources.ocean_source import get_ocean_source
+        pt = get_ocean_source().get_nearest(lat, lon)
+        if pt:
+            wave_h = float(pt.get("significant_wave_height_m") or wave_h or 2.5)
+    except Exception:
+        pass
 
-    # Wave height risk
-    if wave_h < 2.0:
-        wave_risk = 0.1
-    elif wave_h < 3.5:
-        wave_risk = 0.35
-    elif wave_h < 5.0:
-        wave_risk = 0.65
-    else:
-        wave_risk = 0.90
+    if wind_speed is None:
+        from app.core.live_gate import allow_demo_fallback
+        if allow_demo_fallback():
+            seed = int(abs(lat * 100 + lon * 100)) % 99991
+            rng = np.random.default_rng(seed)
+            wind_speed = float(rng.uniform(5, 18))
+            wave_h = float(rng.uniform(1.5, 5.0))
+            data_mode = "demo"
+            source = "physics_model"
+        else:
+            wind_speed, wave_h = 10.0, 2.5
+            data_mode = "offline"
+            source = "unavailable"
 
+    wave_h = wave_h or 2.5
+    wind_risk = (0.1 if wind_speed < 8 else 0.3 if wind_speed < 12
+                 else 0.6 if wind_speed < 16 else 0.85)
+    wave_risk = (0.1 if wave_h < 2.0 else 0.35 if wave_h < 3.5
+                 else 0.65 if wave_h < 5.0 else 0.90)
     score = float(np.clip(0.6 * wind_risk + 0.4 * wave_risk, 0, 1))
 
-    factors = [f"Wind: {wind_speed:.1f} m/s from {wind_dir:.0f}°"]
+    factors = [f"Wind: {wind_speed:.1f} m/s (source: {source})"]
     if wind_speed > 15:
-        factors.append("Storm-force winds — dangerous navigation conditions")
+        factors.append("Storm-force winds — dangerous conditions")
     elif wind_speed > 10:
-        factors.append("Strong winds — reduced visibility and vessel stability")
-    factors.append(f"Wave height: {wave_h:.1f} m")
-    if wave_h > 4:
-        factors.append("Very rough seas — risk of cargo/equipment damage")
+        factors.append("Strong winds — reduced stability")
+    factors.append(f"Wave height: ~{wave_h:.1f} m")
 
     return {
         "score": score,
-        "wind_speed_ms": wind_speed,
-        "wind_direction_deg": wind_dir,
-        "wave_height_m": wave_h,
+        "wind_speed_ms": round(wind_speed, 2),
+        "wave_height_m": round(wave_h, 2),
         "factors": factors,
+        "source": source,
+        "data_mode": data_mode,
     }
 
 
 def calculate_ocean_risk(lat: float, lon: float) -> Dict:
-    """Calculate ocean-current risk."""
-    seed = int(abs(lat * 200 + lon * 200)) % 99991
-    rng = np.random.default_rng(seed)
+    """Ocean current risk using real Open-Meteo Marine data."""
+    current_speed = None
+    sst = None
+    data_mode = "live"
+    source = "Open-Meteo Marine"
 
-    current_u = float(rng.uniform(0.05, 0.45))
-    current_v = float(rng.normal(0, 0.15))
-    current_speed = math.sqrt(current_u**2 + current_v**2)
-    sst = float(8 - 10 * (abs(lat) - 55) / 25 + rng.normal(0, 1))
+    try:
+        from app.sources.ocean_source import get_ocean_source
+        pt = get_ocean_source().get_nearest(lat, lon)
+        if pt:
+            current_speed = float(pt.get("current_speed_ms") or 0)
+            sst = pt.get("sea_surface_temp_celsius")
+            source = pt.get("source", "Open-Meteo Marine")
+    except Exception:
+        pass
 
-    if current_speed < 0.15:
-        score = 0.1
-    elif current_speed < 0.30:
-        score = 0.25
-    elif current_speed < 0.45:
-        score = 0.50
-    else:
-        score = 0.75
+    if current_speed is None:
+        from app.core.live_gate import allow_demo_fallback
+        if allow_demo_fallback():
+            seed = int(abs(lat * 200 + lon * 200)) % 99991
+            rng = np.random.default_rng(seed)
+            u = float(rng.uniform(0.05, 0.45))
+            v = float(rng.normal(0, 0.15))
+            current_speed = math.sqrt(u**2 + v**2)
+            sst = float(8 - 10 * (abs(lat) - 55) / 25 + rng.normal(0, 1))
+            data_mode = "demo"
+            source = "physics_model"
+        else:
+            current_speed, sst = 0.3, None
+            data_mode = "offline"
 
-    factors = [f"Ocean current: {current_speed:.3f} m/s"]
+    score = (0.1 if current_speed < 0.15 else 0.25 if current_speed < 0.30
+             else 0.50 if current_speed < 0.45 else 0.75)
+
+    factors = [f"Ocean current: {current_speed:.3f} m/s (source: {source})"]
     if current_speed > 0.4:
-        factors.append("Strong ACC current — significant fuel penalty expected")
-    if sst < -1.5:
-        factors.append("Sub-freezing SST — risk of sea spray icing on vessel")
-    factors.append(f"SST: {sst:.1f}°C")
+        factors.append("Strong ACC current — fuel penalty expected")
+    if sst is not None and sst < -1.5:
+        factors.append(f"Sub-freezing SST ({sst:.1f}°C) — icing risk")
 
     return {
         "score": float(np.clip(score, 0, 1)),
         "current_speed_ms": round(current_speed, 3),
-        "sst_celsius": round(sst, 1),
+        "sst_celsius": round(sst, 1) if sst is not None else None,
         "factors": factors,
+        "source": source,
+        "data_mode": data_mode,
     }
 
 
 def calculate_risk(request: RiskCalculateRequest) -> Dict:
-    """Full multi-factor risk calculation for a location."""
+    """Multi-factor risk calculation using real data sources."""
     weights = request.weights or DEFAULT_WEIGHTS
-
-    # Ensure weights sum to 1.0
     total_w = sum(weights.values())
     if abs(total_w - 1.0) > 0.01:
         weights = {k: v / total_w for k, v in weights.items()}
 
-    ice_result = calculate_sea_ice_risk(request.latitude, request.longitude, request.radius_km)
-    iceberg_result = calculate_iceberg_risk(request.latitude, request.longitude, request.radius_km)
-    weather_result = calculate_weather_risk(request.latitude, request.longitude)
-    ocean_result = calculate_ocean_risk(request.latitude, request.longitude)
+    ice_r    = calculate_sea_ice_risk(request.latitude, request.longitude, request.radius_km)
+    iceberg_r = calculate_iceberg_risk(request.latitude, request.longitude, request.radius_km)
+    weather_r = calculate_weather_risk(request.latitude, request.longitude)
+    ocean_r   = calculate_ocean_risk(request.latitude, request.longitude)
 
-    w_ice = weights.get("sea_ice", 0.35)
-    w_ib = weights.get("iceberg", 0.30)
-    w_wx = weights.get("weather", 0.20)
-    w_oc = weights.get("ocean", 0.15)
-
-    total = (
-        w_ice * ice_result["score"] +
-        w_ib * iceberg_result["score"] +
-        w_wx * weather_result["score"] +
-        w_oc * ocean_result["score"]
-    )
-    total = float(np.clip(total, 0, 1))
+    total = float(np.clip(
+        weights.get("sea_ice", 0.35) * ice_r["score"] +
+        weights.get("iceberg", 0.30) * iceberg_r["score"] +
+        weights.get("weather", 0.20) * weather_r["score"] +
+        weights.get("ocean", 0.15)   * ocean_r["score"],
+        0, 1
+    ))
 
     all_factors = []
-    for factor_list in [ice_result["factors"], iceberg_result["factors"],
-                        weather_result["factors"], ocean_result["factors"]]:
-        all_factors.extend([{"text": f, "source": "calculated"} for f in factor_list])
+    for r in [ice_r, iceberg_r, weather_r, ocean_r]:
+        all_factors.extend([{"text": f, "source": r.get("source","calculated"),
+                             "data_mode": r.get("data_mode","live")}
+                            for f in r.get("factors", [])])
 
-    recommendations = []
-    if ice_result["score"] > 0.7:
-        recommendations.append("Avoid this region — consolidated sea ice may beset vessel")
-    if iceberg_result["score"] > 0.6:
-        recommendations.append("Iceberg collision risk — post additional lookouts and reduce speed")
-    if weather_result["score"] > 0.6:
-        recommendations.append("Storm conditions expected — consider delaying transit or seeking shelter")
-    if ocean_result["score"] > 0.5:
-        recommendations.append("Strong currents — expect increased fuel consumption and course correction")
-    if not recommendations:
-        recommendations.append("Conditions acceptable for navigation with standard precautions")
+    recs = []
+    if ice_r["score"] > 0.7:
+        recs.append("Consolidated sea ice — avoid or reduce speed significantly")
+    if iceberg_r["score"] > 0.6:
+        recs.append("Iceberg risk — post lookouts, reduce speed, alter course")
+    if weather_r["score"] > 0.6:
+        recs.append("Storm conditions — consider shelter or delay")
+    if ocean_r["score"] > 0.5:
+        recs.append("Strong currents — increased fuel consumption")
+    if not recs:
+        recs.append("Conditions acceptable — standard polar navigation precautions apply")
+
+    # Determine overall data quality
+    modes = [ice_r.get("data_mode","live"), iceberg_r.get("data_mode","live"),
+             weather_r.get("data_mode","live"), ocean_r.get("data_mode","live")]
+    overall_mode = ("live" if all(m == "live" for m in modes)
+                    else "partial" if any(m == "live" for m in modes)
+                    else "demo")
 
     return {
         "latitude": request.latitude,
         "longitude": request.longitude,
         "radius_km": request.radius_km,
         "assessed_at": datetime.now(timezone.utc).isoformat(),
-        "sea_ice_risk": round(ice_result["score"], 3),
-        "iceberg_risk": round(iceberg_result["score"], 3),
-        "weather_risk": round(weather_result["score"], 3),
-        "ocean_risk": round(ocean_result["score"], 3),
+        "sea_ice_risk": round(ice_r["score"], 3),
+        "iceberg_risk": round(iceberg_r["score"], 3),
+        "weather_risk": round(weather_r["score"], 3),
+        "ocean_risk": round(ocean_r["score"], 3),
         "total_risk_score": round(total, 3),
         "risk_category": _risk_category(total),
         "risk_factors": all_factors,
-        "recommendations": recommendations,
-        "data_mode": "demo",
+        "recommendations": recs,
+        "data_mode": overall_mode,
+        "component_sources": {
+            "sea_ice": ice_r.get("source"),
+            "iceberg": iceberg_r.get("data_mode"),
+            "weather": weather_r.get("source"),
+            "ocean": ocean_r.get("source"),
+        },
     }

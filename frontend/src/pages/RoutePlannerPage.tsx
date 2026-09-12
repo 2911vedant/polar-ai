@@ -1,11 +1,12 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import { Navigation, Fuel, Shield, Zap, Scale, AlertTriangle, CheckCircle } from 'lucide-react'
+import { Navigation, Fuel, Shield, Zap, Scale, AlertTriangle, CheckCircle, Ship } from 'lucide-react'
 import { compareRoutes } from '../services/api'
 import PageHeader from '../components/PageHeader'
 import AntarcticMap from '../components/AntarcticMap'
 import LoadingSpinner from '../components/LoadingSpinner'
 import { getRiskBadgeClass } from '../utils/risk'
+import { useActiveVessel } from '../store/vesselStore'
 import type { Route } from '../types'
 
 const STATIONS = [
@@ -15,7 +16,6 @@ const STATIONS = [
   { name: 'Mawson Station', lat: -67.60, lon: 62.87 },
   { name: 'Casey Station', lat: -66.28, lon: 110.52 },
   { name: 'Halley Station', lat: -75.52, lon: -26.57 },
-  { name: 'Vessel Position', lat: -66.0, lon: -60.0 },
 ]
 
 const ROUTE_ICONS: Record<string, any> = {
@@ -98,10 +98,25 @@ function RouteCard({ route, isSelected, isRecommended, onClick }: {
 }
 
 export default function RoutePlannerPage() {
-  const [originIdx, setOriginIdx] = useState(6)  // Vessel Position
+  const activeVessel = useActiveVessel()
   const [destIdx, setDestIdx] = useState(2)      // Rothera
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null)
   const [comparison, setComparison] = useState<any>(null)
+
+  // Build origin: live vessel if available, else first station
+  const vesselOrigin = (activeVessel?.latitude != null)
+    ? { name: `${activeVessel.name || activeVessel.mmsi} (LIVE)`,
+        lat: activeVessel.latitude!, lon: activeVessel.longitude! }
+    : null
+
+  const allOrigins = [
+    ...(vesselOrigin ? [vesselOrigin] : []),
+    ...STATIONS,
+  ]
+  const [originIdx, setOriginIdx] = useState(0)
+
+  const origin = allOrigins[originIdx] || allOrigins[0]
+  const dest   = STATIONS[destIdx]
 
   const mutation = useMutation({
     mutationFn: compareRoutes,
@@ -113,9 +128,6 @@ export default function RoutePlannerPage() {
       }
     },
   })
-
-  const origin = STATIONS[originIdx]
-  const dest = STATIONS[destIdx]
   const selectedRoute = comparison?.routes?.find((r: Route) => r.id === selectedRouteId) || null
 
   return (
@@ -139,7 +151,7 @@ export default function RoutePlannerPage() {
                 onChange={e => setOriginIdx(Number(e.target.value))}
                 className="input-field"
               >
-                {STATIONS.map((s, i) => (
+                {allOrigins.map((s, i) => (
                   <option key={s.name} value={i}>{s.name}</option>
                 ))}
               </select>

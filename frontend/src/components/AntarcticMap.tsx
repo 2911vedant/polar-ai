@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import type { GridPoint, Iceberg, Route, TrajectoryPoint, OceanPoint, WeatherPoint, VesselPosition } from '../types'
-import { getSicColor, getRiskColor } from '../utils/risk'
+import type { GridPoint, Iceberg, Route, TrajectoryPoint, OceanPoint, WeatherPoint } from '../types'
+import { getSicColor } from '../utils/risk'
+import type { VesselSummary } from '../store/vesselStore'
 
 // Fix Leaflet default marker icons
 delete (L.Icon.Default.prototype as any)._getIconUrl
@@ -19,6 +20,7 @@ export interface MapLayers {
   routes?: boolean
   vessel?: boolean
   vesselTrack?: boolean
+  allVessels?: boolean
   oceanCurrents?: boolean
   weather?: boolean
   riskZones?: boolean
@@ -31,18 +33,20 @@ interface AntarcticMapProps {
   routes?: Route[]
   selectedRoute?: Route | null
   trajectories?: Map<string, TrajectoryPoint[]>
-  vessel?: VesselPosition | null
+  vessel?: any | null
+  allVessels?: VesselSummary[]
   vesselTrack?: Array<{ latitude: number; longitude: number }>
   oceanGrid?: OceanPoint[]
   weatherGrid?: WeatherPoint[]
-  satelliteFootprint?: any           // GeoJSON polygon
-  satelliteOpacity?: number          // 0-1
-  seaIceOpacity?: number             // 0-1
+  satelliteFootprint?: any
+  satelliteOpacity?: number
+  seaIceOpacity?: number
   layers?: MapLayers
   height?: string
   followVessel?: boolean
   onIcebergClick?: (iceberg: Iceberg) => void
   onMapClick?: (lat: number, lon: number) => void
+  onVesselClick?: (vessel: VesselSummary) => void
 }
 
 const DEFAULT_LAYERS: MapLayers = {
@@ -58,6 +62,7 @@ export default function AntarcticMap({
   selectedRoute = null,
   trajectories = new Map(),
   vessel = null,
+  allVessels = [],
   vesselTrack = [],
   oceanGrid = [],
   weatherGrid = [],
@@ -69,6 +74,7 @@ export default function AntarcticMap({
   followVessel = false,
   onIcebergClick,
   onMapClick,
+  onVesselClick,
 }: AntarcticMapProps) {
   const mapRef = useRef<HTMLDivElement>(null)
   const mapInstance = useRef<L.Map | null>(null)
@@ -95,7 +101,7 @@ export default function AntarcticMap({
 
     const groups: Record<string, L.LayerGroup> = {}
     for (const key of ['seaIce','icebergs','trajectories','routes','vessel',
-                        'vesselTrack','ocean','weather','satellite']) {
+                        'vesselTrack','allVessels','ocean','weather','satellite']) {
       groups[key] = L.layerGroup().addTo(map)
     }
 
@@ -336,6 +342,32 @@ export default function AntarcticMap({
     })
   }, [oceanGrid, layers.oceanCurrents])
 
+  // ── All Vessels layer (other vessels besides active) ─────────────────────────
+  useEffect(() => {
+    const lg = layerGroups.current.allVessels
+    if (!lg) return
+    lg.clearLayers()
+    if (!layers.allVessels || !allVessels.length) return
+
+    allVessels.forEach(v => {
+      if (v.latitude == null || v.longitude == null) return
+      const isActive = v.mmsi === vessel?.mmsi
+      if (isActive) return // active vessel rendered by vessel layer
+
+      const color = v.is_real ? '#22c55e' : '#f59e0b'
+      const marker = L.circleMarker([v.latitude, v.longitude], {
+        radius: 5, fillColor: color, color: '#0a0e1a', weight: 1.5, fillOpacity: 0.85,
+      }).bindTooltip(
+        `<b>${v.name || v.mmsi}</b><br/>${v.mmsi}<br/>` +
+        `${v.speed?.toFixed(1)} kts · ${v.heading?.toFixed(0)}°<br/>` +
+        `${v.is_real ? '🟢 LIVE' : '🟡 DEMO'}`,
+        { sticky: false }
+      )
+      if (onVesselClick) marker.on('click', () => onVesselClick(v))
+      marker.addTo(lg)
+    })
+  }, [allVessels, layers.allVessels, vessel?.mmsi, onVesselClick])
+
   // ── Satellite footprint ───────────────────────────────────────────────────────
   useEffect(() => {
     const lg = layerGroups.current.satellite
@@ -366,3 +398,7 @@ export default function AntarcticMap({
     <div ref={mapRef} className="w-full rounded-xl border border-polar-border" style={{ height }} />
   )
 }
+
+// ── All-vessels layer ─────────────────────────────────────────────────────────
+// This export is appended at module level — actual hook wired in via useEffect
+// in the component. The allVessels useEffect is handled inline in the component.

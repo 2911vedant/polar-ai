@@ -1,7 +1,7 @@
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
 import {
   LayoutDashboard, Snowflake, Mountain, Navigation,
-  BarChart3, Database, Bot, Cpu,
+  BarChart3, Database, Bot, Cpu, Ship,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { fetchSystemStatus } from './services/api'
@@ -13,12 +13,15 @@ import AnalyticsPage    from './pages/AnalyticsPage'
 import DataSourcesPage  from './pages/DataSourcesPage'
 import NavigatorPage    from './pages/NavigatorPage'
 import SimulationPage   from './pages/SimulationPage'
+import VesselsPage      from './pages/VesselsPage'
 import SystemStatusBar  from './components/SystemStatusBar'
 import AlertBell        from './components/AlertBell'
 import LiveDataEngine   from './components/LiveDataEngine'
+import ActiveVesselBar  from './components/ActiveVesselBar'
 
 const NAV = [
   { path: '/',             icon: LayoutDashboard, label: 'Dashboard' },
+  { path: '/vessels',      icon: Ship,            label: 'Vessels' },
   { path: '/sea-ice',      icon: Snowflake,       label: 'Sea Ice' },
   { path: '/icebergs',     icon: Mountain,        label: 'Icebergs' },
   { path: '/routes',       icon: Navigation,      label: 'Route Planner' },
@@ -34,9 +37,9 @@ function Sidebar() {
     queryFn: fetchSystemStatus,
     refetchInterval: 30_000,
   })
-
-  const mode = status?.effective_data_mode || 'live'
-  const isDemo = mode === 'demo'
+  const mode     = status?.effective_data_mode || 'live'
+  const isDemo   = mode === 'demo'
+  const liveCount = (status?.live || 0) + (status?.near_real_time || 0)
 
   return (
     <aside className="w-60 flex-shrink-0 flex flex-col bg-polar-card border-r border-polar-border h-screen overflow-hidden">
@@ -50,6 +53,12 @@ function Sidebar() {
             <div className="font-bold text-white text-sm tracking-wider">POLAR-AI</div>
             <div className="text-xs text-slate-500">SIH26059 · v2</div>
           </div>
+        </div>
+        <div className="flex items-center gap-1.5 mt-1.5">
+          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${isDemo ? 'bg-amber-400' : 'bg-emerald-400 animate-pulse'}`} />
+          <span className={`text-xs font-mono font-bold ${isDemo ? 'text-amber-400' : 'text-emerald-400'}`}>
+            {isDemo ? 'DEMO MODE' : `LIVE · ${liveCount} sources`}
+          </span>
         </div>
       </div>
 
@@ -68,7 +77,7 @@ function Sidebar() {
         ))}
       </nav>
 
-      {/* Live Data Engine panel */}
+      {/* Live Data Engine */}
       <div className="flex-1 overflow-y-auto px-3 pb-3">
         <div className="border-t border-polar-border pt-3">
           <LiveDataEngine compact={false} />
@@ -77,7 +86,8 @@ function Sidebar() {
 
       <div className="px-3 pb-3 flex-shrink-0">
         <p className="text-xs text-slate-700 leading-tight border border-polar-border rounded p-2">
-          Research prototype.<br />Not for real navigation.
+          {isDemo ? 'DEMO/SIMULATION DATA' : 'LIVE DATA MODE'}<br />
+          Decision support only. Not a certified navigation system.
         </p>
       </div>
     </aside>
@@ -90,18 +100,20 @@ export default function App() {
       <div className="flex h-screen overflow-hidden">
         <Sidebar />
         <main className="flex-1 overflow-y-auto bg-polar-bg pb-8">
-          {/* Top bar */}
+          {/* Top bar with active vessel selector + alert bell */}
           <div className="sticky top-0 z-40 flex items-center justify-between px-6 py-2 bg-polar-bg/95 backdrop-blur border-b border-polar-border">
             <span className="text-xs text-slate-600 font-mono">
               POLAR-AI Antarctic Navigation Intelligence
             </span>
             <div className="flex items-center gap-3">
+              <ActiveVesselBar />
               <AlertBell />
             </div>
           </div>
 
           <Routes>
             <Route path="/"             element={<DashboardPage />} />
+            <Route path="/vessels"      element={<VesselsPage />} />
             <Route path="/sea-ice"      element={<SeaIcePage />} />
             <Route path="/icebergs"     element={<IcebergPage />} />
             <Route path="/routes"       element={<RoutePlannerPage />} />

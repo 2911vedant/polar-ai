@@ -3,6 +3,7 @@ import { useMutation } from '@tanstack/react-query'
 import { Bot, Send, Snowflake, Loader2, Wrench } from 'lucide-react'
 import { queryAgent } from '../services/api'
 import PageHeader from '../components/PageHeader'
+import { useActiveVessel } from '../store/vesselStore'
 
 interface Message {
   id: string
@@ -92,6 +93,7 @@ function MessageBubble({ msg }: { msg: Message }) {
 }
 
 export default function NavigatorPage() {
+  const activeVessel = useActiveVessel()
   const [messages, setMessages] = useState<Message[]>([
     {
       id: 'welcome',
@@ -105,7 +107,8 @@ export default function NavigatorPage() {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   const mutation = useMutation({
-    mutationFn: ({ query }: { query: string }) => queryAgent(query),
+    mutationFn: ({ query, context }: { query: string; context?: Record<string, any> }) =>
+      queryAgent(query, context || {}),
     onSuccess: (data) => {
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
@@ -126,7 +129,20 @@ export default function NavigatorPage() {
       content: text,
       timestamp: new Date().toISOString(),
     }])
-    mutation.mutate({ query: text })
+    // Include active vessel context
+    const context: Record<string, any> = {}
+    if (activeVessel) {
+      context.active_vessel = {
+        mmsi: activeVessel.mmsi,
+        name: activeVessel.name,
+        latitude: activeVessel.latitude,
+        longitude: activeVessel.longitude,
+        speed: activeVessel.speed,
+        heading: activeVessel.heading,
+        is_real: activeVessel.is_real,
+      }
+    }
+    mutation.mutate({ query: text, context })
     setInput('')
   }
 
